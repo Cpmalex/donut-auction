@@ -1,0 +1,741 @@
+name: Build donut-auction jar
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.4.0
+      - name: Write project files
+        run: |
+          mkdir -p proj && cd proj
+          cat > README.txt <<'__END_0__'
+          BUILD THE JAR
+          Option A (PC): install Java 25 + Gradle 9.4, run "gradle build" here. Jar: build/libs/donut-auction-1.0.0.jar (not the -sources jar).
+          Option B (no install): make a free GitHub repo, upload this folder's contents, open Actions > "Build jar" > Run workflow, then download the "donut-auction-jar" artifact.
+          INSTALL: put the jar in .minecraft/mods with Fabric Loader 0.18.4+ and Fabric API 0.152.1+26.1.2.
+          __END_0__
+          cat > build.gradle <<'__END_1__'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          repositories { }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": inputs.properties.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+              it.options.encoding = 'UTF-8'
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          __END_1__
+          cat > gradle.properties <<'__END_2__'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          # Get the exact current numbers from https://fabricmc.net/develop (pick 26.1.x)
+          minecraft_version=26.1
+          loader_version=0.18.4
+          loom_version=1.15-SNAPSHOT
+          fabric_api_version=0.152.1+26.1.2
+
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=donut-auction
+          __END_2__
+          cat > settings.gradle <<'__END_3__'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'donut-auction'
+          __END_3__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/AuctionConfig.java <<'__END_4__'
+          package com.example.donutauction;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+
+          public final class AuctionConfig {
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static final Path FILE = FabricLoader.getInstance().getConfigDir().resolve("donutauction.json");
+
+              public int hudX = -1; // -1 = centered
+              public int hudY = -1; // -1 = lower third
+              public int lastQty = 1;
+              public int lastDuration = 30;
+              public double lastWorth = 0;
+
+              public static AuctionConfig INSTANCE = new AuctionConfig();
+
+              public static void load() {
+                  try {
+                      if (Files.exists(FILE)) {
+                          AuctionConfig c = GSON.fromJson(Files.readString(FILE), AuctionConfig.class);
+                          if (c != null) INSTANCE = c;
+                      }
+                  } catch (Exception ignored) {}
+              }
+
+              public static void save() {
+                  try { Files.writeString(FILE, GSON.toJson(INSTANCE)); } catch (Exception ignored) {}
+              }
+          }
+          __END_4__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/AuctionHud.java <<'__END_5__'
+          package com.example.donutauction;
+
+          import net.minecraft.client.DeltaTracker;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.Font;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+
+          public final class AuctionHud {
+              public static final int PAD = 6;
+              public static final int LINE = 11;
+
+              private AuctionHud() {}
+
+              public static boolean visible() {
+                  return AuctionManager.active || (AuctionManager.resultLine != null
+                          && System.currentTimeMillis() < AuctionManager.resultUntilMs);
+              }
+
+              public static void render(GuiGraphicsExtractor g, DeltaTracker dt) {
+                  if (!visible()) return;
+                  draw(g, false);
+              }
+
+              /** Width/height of the box for the current content (or a demo when preview is true). */
+              public static int[] size(boolean preview) {
+                  Font f = Minecraft.getInstance().font;
+                  String title = titleText(preview);
+                  int w = Math.max(140, f.width(title) + 24 + f.width(timerText(preview)) + PAD * 2 + 10);
+                  int lines = AuctionManager.active || preview ? 3 : 1;
+                  int h = PAD * 2 + LINE + 5 + lines * LINE;
+                  if (!AuctionManager.active && !preview) w = Math.max(w, f.width(AuctionManager.resultLine) + PAD * 2);
+                  return new int[]{w, h};
+              }
+
+              public static int[] position(boolean preview) {
+                  Minecraft mc = Minecraft.getInstance();
+                  int[] s = size(preview);
+                  int sw = mc.getWindow().getGuiScaledWidth();
+                  int sh = mc.getWindow().getGuiScaledHeight();
+                  AuctionConfig c = AuctionConfig.INSTANCE;
+                  int x = c.hudX < 0 ? (sw - s[0]) / 2 : c.hudX;
+                  int y = c.hudY < 0 ? sh * 2 / 3 - s[1] : c.hudY;
+                  return new int[]{Math.max(0, Math.min(x, sw - s[0])), Math.max(0, Math.min(y, sh - s[1]))};
+              }
+
+              private static String titleText(boolean preview) {
+                  if (preview && !AuctionManager.active) return "AUCTION · 1 × Elytra";
+                  if (!AuctionManager.active) return "AUCTION ENDED";
+                  return "AUCTION · " + AuctionManager.stack.getCount() + " × "
+                          + AuctionManager.stack.getHoverName().getString();
+              }
+
+              private static String timerText(boolean preview) {
+                  if (preview && !AuctionManager.active) return "00:58";
+                  if (!AuctionManager.active) return "";
+                  int s = AuctionManager.secondsLeft();
+                  return String.format("%02d:%02d", s / 60, s % 60);
+              }
+
+              public static void draw(GuiGraphicsExtractor g, boolean preview) {
+                  Minecraft mc = Minecraft.getInstance();
+                  Font f = mc.font;
+                  int[] s = size(preview);
+                  int[] p = position(preview);
+                  int x = p[0], y = p[1], w = s[0], h = s[1];
+
+                  // background + gold border
+                  g.fill(x, y, x + w, y + h, 0xE6000000);
+                  int gold = 0xFFC8A040;
+                  g.fill(x, y, x + w, y + 1, gold);
+                  g.fill(x, y + h - 1, x + w, y + h, gold);
+                  g.fill(x, y, x + 1, y + h, gold);
+                  g.fill(x + w - 1, y, x + w, y + h, gold);
+
+                  boolean demo = preview && !AuctionManager.active;
+                  ItemStack icon = demo ? new ItemStack(Items.ELYTRA) : AuctionManager.stack;
+                  int tx = x + PAD;
+                  if (!icon.isEmpty()) {
+                      g.item(icon, x + PAD - 2, y + PAD - 4);
+                      tx += 14;
+                  }
+                  g.text(f, titleText(preview), tx, y + PAD, 0xFFFFFFFF);
+                  String timer = timerText(preview);
+                  g.text(f, timer, x + w - PAD - f.width(timer), y + PAD, 0xFFFFFFFF);
+
+                  int ly = y + PAD + LINE + 2;
+                  g.fill(x + PAD, ly, x + w - PAD, ly + 1, 0xFF555555);
+                  ly += 4;
+
+                  if (AuctionManager.active || demo) {
+                      double worth = demo ? 410 : AuctionManager.worth;
+                      String top = demo || AuctionManager.highestBidder == null
+                              ? "none yet" : "$" + Money.format(AuctionManager.highestBid) + " · " + AuctionManager.highestBidder;
+                      int bids = demo ? 0 : AuctionManager.bids;
+                      g.text(f, "worth  $" + Money.format(worth), x + PAD, ly, 0xFFFFD36B);
+                      g.text(f, "highest bid  " + top, x + PAD, ly + LINE, 0xFFFFFFFF);
+                      g.text(f, "bids  " + bids + " bids", x + PAD, ly + LINE * 2, 0xFFB0B0B0);
+                  } else {
+                      g.text(f, AuctionManager.resultLine, x + PAD, ly, 0xFF7DFF7D);
+                  }
+              }
+          }
+          __END_5__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/AuctionManager.java <<'__END_6__'
+          package com.example.donutauction;
+
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.item.ItemStack;
+
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public final class AuctionManager {
+              // "Name » 500", "[VIP] Name: 1.5k", "<Name> $2m" style bids. The message must END with the bid.
+              private static final Pattern BID = Pattern.compile(
+                      "(\\w{3,16})>?\\s*(?:»|>>|:|>|-)\\s*\\$?(\\d[\\d,]*(?:\\.\\d+)?\\s*[kKmMbB]?)\\s*$");
+
+              public static boolean active = false;
+              public static ItemStack stack = ItemStack.EMPTY;
+              public static long endMs;
+              public static double worth;
+              public static double highestBid;
+              public static String highestBidder;
+              public static int bids;
+
+              // result banner after an auction ends
+              public static String resultLine;
+              public static long resultUntilMs;
+
+              private AuctionManager() {}
+
+              public static void start(ItemStack s, int seconds, double w) {
+                  stack = s.copy();
+                  worth = w;
+                  highestBid = 0;
+                  highestBidder = null;
+                  bids = 0;
+                  endMs = System.currentTimeMillis() + seconds * 1000L;
+                  active = true;
+                  resultLine = null;
+                  say("[Auction] Auction started · " + s.getCount() + " × " + s.getHoverName().getString()
+                          + " · " + seconds + "s");
+              }
+
+              public static void cancel() {
+                  if (!active) return;
+                  active = false;
+                  say("[Auction] Auction cancelled");
+              }
+
+              public static int secondsLeft() {
+                  return (int) Math.max(0, Math.ceil((endMs - System.currentTimeMillis()) / 1000.0));
+              }
+
+              public static void tick() {
+                  if (active && System.currentTimeMillis() >= endMs) finish();
+              }
+
+              private static void finish() {
+                  active = false;
+                  String item = stack.getCount() + " × " + stack.getHoverName().getString();
+                  if (highestBidder == null) {
+                      resultLine = "No bids · " + item;
+                  } else {
+                      resultLine = highestBidder + " won " + item + " for $" + Money.format(highestBid);
+                  }
+                  resultUntilMs = System.currentTimeMillis() + 10_000;
+                  say("[Auction] " + resultLine);
+              }
+
+              public static void onChat(String plain) {
+                  if (!active || plain == null) return;
+                  if (plain.startsWith("[Auction]")) return;
+                  Matcher m = BID.matcher(plain.trim());
+                  if (!m.find()) return;
+                  String name = m.group(1);
+                  double amount = Money.parse(m.group(2));
+                  if (Double.isNaN(amount) || amount <= 0) return;
+                  bids++;
+                  if (amount > highestBid) {
+                      highestBid = amount;
+                      highestBidder = name;
+                      say("[Auction] New highest bid: $" + Money.format(amount) + " by " + name);
+                  }
+              }
+
+              private static void say(String s) {
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.player != null) mc.player.sendSystemMessage(Component.literal(s));
+              }
+          }
+          __END_6__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/AuctionScreen.java <<'__END_7__'
+          package com.example.donutauction;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.KeyEvent;
+          import net.minecraft.client.input.MouseButtonEvent;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+
+          public class AuctionScreen extends Screen {
+              private static final int[] QTY = {1, 2, 3, 4, 8, 16, 32, 64};
+              private static final int[] DUR = {15, 30, 60, 90, 120};
+              private static final int COLS = 9, ROWS = 5, CELL = 20;
+              private static final int PW = 200, PH = 262;
+
+              private final List<ItemStack> all = new ArrayList<>();
+              private List<ItemStack> shown = new ArrayList<>();
+              private final List<Button> qtyBtns = new ArrayList<>();
+              private final List<Button> durBtns = new ArrayList<>();
+              private EditBox search, worthBox;
+              private ItemStack selected = ItemStack.EMPTY;
+              private int qty, dur, scroll;
+              private int px, py;
+
+              public AuctionScreen() {
+                  super(Component.literal("Auction"));
+                  qty = AuctionConfig.INSTANCE.lastQty;
+                  dur = AuctionConfig.INSTANCE.lastDuration;
+                  for (Item item : BuiltInRegistries.ITEM) {
+                      if (item != Items.AIR) all.add(new ItemStack(item));
+                  }
+                  shown = new ArrayList<>(all);
+              }
+
+              @Override
+              protected void init() {
+                  px = (this.width - PW) / 2;
+                  py = (this.height - PH) / 2;
+
+                  search = new EditBox(this.font, px + 10, py + 22, PW - 20, 16, Component.literal("Search"));
+                  search.setHint(Component.literal("search items…"));
+                  search.setResponder(this::filter);
+                  addRenderableWidget(search);
+
+                  qtyBtns.clear();
+                  for (int i = 0; i < QTY.length; i++) {
+                      final int q = QTY[i];
+                      Button b = Button.builder(Component.literal("x" + q), btn -> { qty = q; refreshButtons(); })
+                              .bounds(px + 10 + i * 22, py + 168, 21, 14).build();
+                      qtyBtns.add(b);
+                      addRenderableWidget(b);
+                  }
+                  durBtns.clear();
+                  for (int i = 0; i < DUR.length; i++) {
+                      final int d = DUR[i];
+                      Button b = Button.builder(Component.literal(d + "s"), btn -> { dur = d; refreshButtons(); })
+                              .bounds(px + 10 + i * 36, py + 198, 35, 14).build();
+                      durBtns.add(b);
+                      addRenderableWidget(b);
+                  }
+
+                  worthBox = new EditBox(this.font, px + 45, py + 218, 100, 14, Component.literal("Worth"));
+                  worthBox.setHint(Component.literal("e.g. 410 or 1.5k"));
+                  double w = AuctionConfig.INSTANCE.lastWorth;
+                  if (w > 0) worthBox.setValue(Money.format(w));
+                  addRenderableWidget(worthBox);
+
+                  addRenderableWidget(Button.builder(Component.literal("START AUCTION"), btn -> start())
+                          .bounds(px + 10, py + 238, PW - 20, 18).build());
+                  refreshButtons();
+              }
+
+              private void refreshButtons() {
+                  for (int i = 0; i < QTY.length; i++) {
+                      qtyBtns.get(i).setMessage(Component.literal(QTY[i] == qty ? ">x" + QTY[i] : "x" + QTY[i]));
+                  }
+                  for (int i = 0; i < DUR.length; i++) {
+                      durBtns.get(i).setMessage(Component.literal(DUR[i] == dur ? ">" + DUR[i] + "s" : DUR[i] + "s"));
+                  }
+              }
+
+              private void filter(String q) {
+                  String s = q.toLowerCase(Locale.ROOT).trim();
+                  shown = new ArrayList<>();
+                  for (ItemStack st : all) {
+                      if (s.isEmpty() || st.getHoverName().getString().toLowerCase(Locale.ROOT).contains(s)) shown.add(st);
+                  }
+                  scroll = 0;
+              }
+
+              private void start() {
+                  if (selected.isEmpty()) {
+                      if (minecraft.player != null) minecraft.player.sendSystemMessage(Component.literal("[Auction] Pick an item first"));
+                      return;
+                  }
+                  double worth = worthBox.getValue().isBlank() ? 0 : Money.parse(worthBox.getValue());
+                  if (Double.isNaN(worth)) worth = 0;
+                  int q = Math.min(qty, selected.getMaxStackSize());
+                  ItemStack s = new ItemStack(selected.getItem(), q);
+                  AuctionConfig c = AuctionConfig.INSTANCE;
+                  c.lastQty = qty; c.lastDuration = dur; c.lastWorth = worth;
+                  AuctionConfig.save();
+                  AuctionManager.start(s, dur, worth);
+                  onClose();
+              }
+
+              // Panel is drawn in the background pass so it sits under the widgets.
+              @Override
+              public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float partial) {
+                  super.extractBackground(g, mouseX, mouseY, partial);
+                  g.fill(px, py, px + PW, py + PH, 0xF0000000);
+                  int gold = 0xFFC8A040;
+                  g.fill(px, py, px + PW, py + 1, gold);
+                  g.fill(px, py + PH - 1, px + PW, py + PH, gold);
+                  g.fill(px, py, px + 1, py + PH, gold);
+                  g.fill(px + PW - 1, py, px + PW, py + PH, gold);
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partial) {
+                  super.extractRenderState(g, mouseX, mouseY, partial);
+
+                  g.centeredText(this.font, "AUCTION", px + PW / 2, py + 6, 0xFFC8A040);
+                  g.centeredText(this.font, "pick an item · set a timer · highest chat bid wins", px + PW / 2, py + 12 + 0, 0xFF777777);
+
+                  int gx = px + 10, gy = py + 44;
+                  ItemStack hover = ItemStack.EMPTY;
+                  for (int r = 0; r < ROWS; r++) {
+                      for (int c = 0; c < COLS; c++) {
+                          int idx = (scroll + r) * COLS + c;
+                          if (idx >= shown.size()) break;
+                          ItemStack st = shown.get(idx);
+                          int x = gx + c * CELL, y = gy + r * CELL;
+                          boolean isSel = !selected.isEmpty() && st.getItem() == selected.getItem();
+                          boolean isHover = mouseX >= x && mouseX < x + CELL && mouseY >= y && mouseY < y + CELL;
+                          if (isSel) g.fill(x, y, x + CELL, y + CELL, 0xFF6A5A1E);
+                          else if (isHover) g.fill(x, y, x + CELL, y + CELL, 0xFF444444);
+                          g.item(st, x + 2, y + 2);
+                          if (isHover) hover = st;
+                      }
+                  }
+                  if (!hover.isEmpty()) {
+                      String n = hover.getHoverName().getString();
+                      int tw = this.font.width(n) + 6;
+                      int tx = Math.min(mouseX + 8, this.width - tw), ty = mouseY - 14;
+                      g.fill(tx, ty, tx + tw, ty + 12, 0xF0100010);
+                      g.text(this.font, n, tx + 3, ty + 2, 0xFFFFFFFF);
+                  }
+
+                  String line = selected.isEmpty() ? "AUCTION · no item selected"
+                          : "AUCTION · " + Math.min(qty, selected.getMaxStackSize()) + " × " + selected.getHoverName().getString();
+                  g.text(this.font, line, px + 10, py + 148, 0xFFFFFFFF);
+                  g.text(this.font, "Quantity · " + qty, px + 10, py + 158, 0xFFAAAAAA);
+                  g.text(this.font, "Duration", px + 10, py + 188, 0xFFAAAAAA);
+                  g.text(this.font, "Worth", px + 10, py + 221, 0xFFAAAAAA);
+              }
+
+              @Override
+              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+                  if (super.mouseClicked(event, doubleClick)) return true;
+                  int gx = px + 10, gy = py + 44;
+                  double mx = event.x() - gx, my = event.y() - gy;
+                  if (mx >= 0 && my >= 0 && mx < COLS * CELL && my < ROWS * CELL) {
+                      int idx = (scroll + (int) (my / CELL)) * COLS + (int) (mx / CELL);
+                      if (idx < shown.size()) {
+                          selected = shown.get(idx);
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double sx, double sy) {
+                  int maxScroll = Math.max(0, (shown.size() + COLS - 1) / COLS - ROWS);
+                  scroll = Math.max(0, Math.min(maxScroll, scroll - (int) Math.signum(sy)));
+                  return true;
+              }
+
+              @Override
+              public boolean keyPressed(KeyEvent event) {
+                  boolean typing = search.isFocused() || worthBox.isFocused();
+                  if (!typing && event.key() == InputConstants.KEY_J) {
+                      onClose();
+                      return true;
+                  }
+                  return super.keyPressed(event);
+              }
+
+              @Override
+              public void onClose() {
+                  AuctionConfig.save();
+                  super.onClose();
+              }
+          }
+          __END_7__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/DonutAuctionClient.java <<'__END_8__'
+          package com.example.donutauction;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.world.item.ItemStack;
+
+          public class DonutAuctionClient implements ClientModInitializer {
+              public static KeyMapping OPEN, QUICK, MOVE;
+
+              @Override
+              public void onInitializeClient() {
+                  AuctionConfig.load();
+
+                  KeyMapping.Category cat = KeyMapping.Category.register(Identifier.fromNamespaceAndPath("donutauction", "main"));
+                  OPEN = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.donutauction.open", InputConstants.KEY_J, cat));
+                  QUICK = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.donutauction.quick", InputConstants.KEY_V, cat));
+                  MOVE = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.donutauction.move", InputConstants.KEY_H, cat));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      AuctionManager.tick();
+                      while (OPEN.consumeClick()) {
+                          if (mc.screen == null) mc.setScreen(new AuctionScreen());
+                      }
+                      while (MOVE.consumeClick()) {
+                          if (mc.screen == null) mc.setScreen(new HudMoveScreen());
+                      }
+                      while (QUICK.consumeClick()) {
+                          if (mc.screen == null) quick(mc);
+                      }
+                  });
+
+                  HudElementRegistry.attachElementAfter(VanillaHudElements.CHAT,
+                          Identifier.fromNamespaceAndPath("donutauction", "hud"), AuctionHud::render);
+
+                  // Server-formatted chat (most servers) and signed player chat
+                  ClientReceiveMessageEvents.GAME.register((msg, overlay) -> {
+                      if (!overlay) AuctionManager.onChat(msg.getString());
+                  });
+                  ClientReceiveMessageEvents.CHAT.register((msg, signed, sender, params, ts) -> {
+                      String name = sender != null ? sender.name() : "?";
+                      AuctionManager.onChat(name + " » " + msg.getString());
+                  });
+              }
+
+              /** V: auction whatever you're holding, using your last quantity/duration/worth. */
+              private static void quick(Minecraft mc) {
+                  if (mc.player == null) return;
+                  ItemStack held = mc.player.getMainHandItem();
+                  if (held.isEmpty()) {
+                      mc.player.sendSystemMessage(Component.literal("[Auction] Hold an item to quick-auction it"));
+                      return;
+                  }
+                  AuctionConfig c = AuctionConfig.INSTANCE;
+                  int q = Math.min(c.lastQty, held.getMaxStackSize());
+                  AuctionManager.start(new ItemStack(held.getItem(), q), c.lastDuration, c.lastWorth);
+              }
+          }
+          __END_8__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/HudMoveScreen.java <<'__END_9__'
+          package com.example.donutauction;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.KeyEvent;
+          import net.minecraft.client.input.MouseButtonEvent;
+          import net.minecraft.network.chat.Component;
+
+          public class HudMoveScreen extends Screen {
+              private boolean dragging;
+
+              public HudMoveScreen() {
+                  super(Component.literal("Move auction HUD"));
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float partial) {
+                  super.extractRenderState(g, mouseX, mouseY, partial);
+                  AuctionHud.draw(g, true);
+                  g.centeredText(this.font, "Drag the box · press H or Esc to save", this.width / 2, 12, 0xFFFFFFFF);
+              }
+
+              @Override
+              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+                  int[] p = AuctionHud.position(true);
+                  int[] s = AuctionHud.size(true);
+                  dragging = event.x() >= p[0] && event.x() <= p[0] + s[0] && event.y() >= p[1] && event.y() <= p[1] + s[1];
+                  return dragging || super.mouseClicked(event, doubleClick);
+              }
+
+              @Override
+              public boolean mouseDragged(MouseButtonEvent event, double dx, double dy) {
+                  if (dragging) {
+                      int[] p = AuctionHud.position(true);
+                      AuctionConfig.INSTANCE.hudX = (int) (p[0] + dx);
+                      AuctionConfig.INSTANCE.hudY = (int) (p[1] + dy);
+                      return true;
+                  }
+                  return super.mouseDragged(event, dx, dy);
+              }
+
+              @Override
+              public boolean mouseReleased(MouseButtonEvent event) {
+                  dragging = false;
+                  return super.mouseReleased(event);
+              }
+
+              @Override
+              public boolean keyPressed(KeyEvent event) {
+                  if (event.key() == InputConstants.KEY_H) {
+                      onClose();
+                      return true;
+                  }
+                  return super.keyPressed(event);
+              }
+
+              @Override
+              public void onClose() {
+                  AuctionConfig.save();
+                  super.onClose();
+              }
+          }
+          __END_9__
+          mkdir -p src/main/java/com/example/donutauction
+          cat > src/main/java/com/example/donutauction/Money.java <<'__END_10__'
+          package com.example.donutauction;
+
+          import java.util.Locale;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public final class Money {
+              private static final Pattern P = Pattern.compile("^\\$?(\\d[\\d,]*(?:\\.\\d+)?)\\s*([kmbKMB])?$");
+
+              private Money() {}
+
+              /** "1.5k" -> 1500. Returns NaN if it isn't a number. */
+              public static double parse(String s) {
+                  if (s == null) return Double.NaN;
+                  Matcher m = P.matcher(s.trim());
+                  if (!m.matches()) return Double.NaN;
+                  double v = Double.parseDouble(m.group(1).replace(",", ""));
+                  String suf = m.group(2);
+                  if (suf != null) {
+                      switch (suf.toLowerCase(Locale.ROOT)) {
+                          case "k" -> v *= 1_000;
+                          case "m" -> v *= 1_000_000;
+                          case "b" -> v *= 1_000_000_000;
+                      }
+                  }
+                  return v;
+              }
+
+              public static String format(double v) {
+                  if (v >= 1_000_000_000) return trim(v / 1_000_000_000) + "B";
+                  if (v >= 1_000_000) return trim(v / 1_000_000) + "M";
+                  if (v >= 1_000) return trim(v / 1_000) + "K";
+                  return trim(v);
+              }
+
+              private static String trim(double v) {
+                  String s = String.format(Locale.ROOT, "%.1f", v);
+                  return s.endsWith(".0") ? s.substring(0, s.length() - 2) : s;
+              }
+          }
+          __END_10__
+          mkdir -p src/main/resources/assets/donutauction/lang
+          cat > src/main/resources/assets/donutauction/lang/en_us.json <<'__END_11__'
+          {
+            "key.category.donutauction.main": "Donut Auction",
+            "key.donutauction.open": "Open auction menu / close",
+            "key.donutauction.quick": "Quick auction (held item)",
+            "key.donutauction.move": "Move auction HUD"
+          }
+          __END_11__
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'__END_12__'
+          {
+            "schemaVersion": 1,
+            "id": "donutauction",
+            "version": "${version}",
+            "name": "Donut Auction HUD",
+            "description": "Client-side live auction overlay for streamers. Pick an item, set a timer, highest chat bid wins.",
+            "authors": ["you"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.donutauction.DonutAuctionClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.18.4",
+              "minecraft": "~26.1",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          __END_12__
+      - name: Build
+        working-directory: proj
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: donut-auction-jar
+          path: proj/build/libs/*.jar
