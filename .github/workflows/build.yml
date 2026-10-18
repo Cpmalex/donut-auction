@@ -236,9 +236,10 @@ jobs:
           import java.util.regex.Pattern;
 
           public final class AuctionManager {
-              // "Name » 500", "[VIP] Name: 1.5k", "<Name> $2m" style bids. The message must END with the bid.
-              private static final Pattern BID = Pattern.compile(
-                      "(\\w{3,16})>?\\s*(?:»|>>|:|>|-)\\s*\\$?(\\d[\\d,]*(?:\\.\\d+)?\\s*[kKmMbB]?)\\s*$");
+              private static final Pattern PAID = Pattern.compile(
+                      "(\\w{3,16})\\s+paid you\\s+\\S*?\\s*(\\d[\\d,]*(?:\\.\\d+)?\\s*[kKmMbB]?)\\s*$");
+              private static final Pattern SEP_NAME = Pattern.compile(
+                      "^(?:\\[[^\\]]*\\]\\s*)*(\\w{3,16})>?\\s*(?:»|>>|:|>|-)");
 
               public static boolean active = false;
               public static ItemStack stack = ItemStack.EMPTY;
@@ -295,12 +296,45 @@ jobs:
 
               public static void onChat(String plain) {
                   if (!active || plain == null) return;
-                  if (plain.startsWith("[Auction]")) return;
-                  Matcher m = BID.matcher(plain.trim());
-                  if (!m.find()) return;
-                  String name = m.group(1);
-                  double amount = Money.parse(m.group(2));
-                  if (Double.isNaN(amount) || amount <= 0) return;
+                  String text = plain.trim();
+                  if (text.startsWith("[Auction]") || text.startsWith("You whisper") || text.contains(" whispers to you")) return;
+
+                  // "Name paid you $500" counts as a bid
+                  Matcher pm = PAID.matcher(text);
+                  if (pm.find()) {
+                      double amt = Money.parse(pm.group(2).replaceAll("\\s", ""));
+                      if (!Double.isNaN(amt)) accept(pm.group(1), amt);
+                      return;
+                  }
+
+                  // Any chat line that ENDS with a number is a bid: "Name » 500", "[Rank] Name: 1.5k", "Name 2m"
+                  String[] tok = text.split("\\s+");
+                  if (tok.length < 2) return;
+                  double amount = Money.parse(tok[tok.length - 1].replaceAll("^[^0-9]+", ""));
+                  if (Double.isNaN(amount)) return;
+                  String name = findName(tok, text);
+                  if (name != null) accept(name, amount);
+              }
+
+              private static String findName(String[] tok, String text) {
+                  Minecraft mc = Minecraft.getInstance();
+                  java.util.Map<String, String> online = new java.util.HashMap<>();
+                  if (mc.getConnection() != null) {
+                      for (var info : mc.getConnection().getOnlinePlayers()) {
+                          String n = info.getProfile().name();
+                          online.put(n.toLowerCase(java.util.Locale.ROOT), n);
+                      }
+                  }
+                  for (int i = 0; i < tok.length - 1; i++) {
+                      String t = tok[i].replaceAll("[^\\w]", "").toLowerCase(java.util.Locale.ROOT);
+                      if (online.containsKey(t)) return online.get(t);
+                  }
+                  Matcher m = SEP_NAME.matcher(text);
+                  return m.find() ? m.group(1) : null;
+              }
+
+              private static void accept(String name, double amount) {
+                  if (amount <= 0) return;
                   bids++;
                   if (amount > highestBid) {
                       highestBid = amount;
@@ -424,7 +458,7 @@ jobs:
                   }
                   double worth = worthBox.getValue().isBlank() ? 0 : Money.parse(worthBox.getValue());
                   if (Double.isNaN(worth)) worth = 0;
-                  int q = Math.min(qty, selected.getMaxStackSize());
+                  int q = qty;
                   ItemStack s = new ItemStack(selected.getItem(), q);
                   AuctionConfig c = AuctionConfig.INSTANCE;
                   c.lastQty = qty; c.lastDuration = dur; c.lastWorth = worth;
@@ -477,7 +511,7 @@ jobs:
                   }
 
                   String line = selected.isEmpty() ? "AUCTION · no item selected"
-                          : "AUCTION · " + Math.min(qty, selected.getMaxStackSize()) + " × " + selected.getHoverName().getString();
+                          : "AUCTION · " + qty + " × " + selected.getHoverName().getString();
                   g.text(this.font, line, px + 10, py + 148, 0xFFFFFFFF);
                   g.text(this.font, "Quantity · " + qty, px + 10, py + 158, 0xFFAAAAAA);
                   g.text(this.font, "Duration", px + 10, py + 188, 0xFFAAAAAA);
@@ -573,8 +607,8 @@ jobs:
                       if (!overlay) AuctionManager.onChat(msg.getString());
                   });
                   ClientReceiveMessageEvents.CHAT.register((msg, signed, sender, params, ts) -> {
-                      String name = sender != null ? sender.name() : "?";
-                      AuctionManager.onChat(name + " » " + msg.getString());
+                      // signed chat: msg is only the body; unsigned/disguised chat: msg already has the name
+                      AuctionManager.onChat(sender != null ? sender.name() + " » " + msg.getString() : msg.getString());
                   });
               }
 
@@ -587,7 +621,7 @@ jobs:
                       return;
                   }
                   AuctionConfig c = AuctionConfig.INSTANCE;
-                  int q = Math.min(c.lastQty, held.getMaxStackSize());
+                  int q = c.lastQty;
                   AuctionManager.start(new ItemStack(held.getItem(), q), c.lastDuration, c.lastWorth);
               }
           }
